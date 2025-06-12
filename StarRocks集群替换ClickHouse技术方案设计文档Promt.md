@@ -26,6 +26,7 @@
 10、其他约束：替换动作不一定要在运维周期内完成，只是需要业务上无感就可以了。比如可以考虑staarocks中支持Clickhouse的数据源，然后新数据直接写starrocks，在starrocks中通过视图的方式让用户同时使用CLickhouse和Starrocks的数据，待Clickhouse中的数据全部过期后再把Clickhouse下线掉，彻底切换为starrocks，这只是个想法距离，具体请大模型自己思考  
 
 【章节要求】
+
 1、背景介绍：{这里输出整个项目的背景}  
 
 2、目标：{这里输出方案的目标}  
