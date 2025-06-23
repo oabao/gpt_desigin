@@ -204,34 +204,34 @@ StarRocks 集群替换 ClickHouse 技术方案设计文档
 CREATE EXTERNAL TABLE ch\_table (
 
 
-&#x20;   id INT,
+   id INT,
 
 
-&#x20;   name STRING,
+   name STRING,
 
 
-&#x20;   create\_time DATETIME
+   create\_time DATETIME
 
 
-)&#x20;
+)
 
 
 ENGINE = CH(
 
 
-&#x20;   'clickhouse-node1:9000,clickhouse-node2:9000,clickhouse-node3:9000',
+   'clickhouse-node1:9000,clickhouse-node2:9000,clickhouse-node3:9000',
 
 
-&#x20;   'database',
+   'database',
 
 
-&#x20;   'table',
+   'table',
 
 
-&#x20;   'user',
+   'user',
 
 
-&#x20;   'password'
+   'password'
 
 
 );
@@ -256,67 +256,67 @@ SELECT id, name, create\_time FROM ch\_table WHERE create\_time >= '2025-06-01';
 public void doubleWrite(String data) {
 
 
-&#x20;   // 写入ClickHouse事务
+   // 写入ClickHouse事务
 
 
-&#x20;   try (Connection chConn = DriverManager.getConnection(chUrl, chUser, chPassword);
+   try (Connection chConn = DriverManager.getConnection(chUrl, chUser, chPassword);
 
 
-&#x20;        PreparedStatement chStmt = chConn.prepareStatement(chInsertSql)) {
+        PreparedStatement chStmt = chConn.prepareStatement(chInsertSql)) {
 
 
-&#x20;       chConn.setAutoCommit(false);
+       chConn.setAutoCommit(false);
 
 
-&#x20;       chStmt.setString(1, data);
+       chStmt.setString(1, data);
 
 
-&#x20;       chStmt.executeUpdate();
+       chStmt.executeUpdate();
 
 
-&#x20;       // 写入StarRocks事务
+       // 写入StarRocks事务
 
 
-&#x20;       try (Connection srConn = DriverManager.getConnection(srUrl, srUser, srPassword);
+       try (Connection srConn = DriverManager.getConnection(srUrl, srUser, srPassword);
 
 
-&#x20;            PreparedStatement srStmt = srConn.prepareStatement(srInsertSql)) {
+            PreparedStatement srStmt = srConn.prepareStatement(srInsertSql)) {
 
 
-&#x20;           srConn.setAutoCommit(false);
+           srConn.setAutoCommit(false);
 
 
-&#x20;           srStmt.setString(1, data);
+           srStmt.setString(1, data);
 
 
-&#x20;           srStmt.executeUpdate();
+           srStmt.executeUpdate();
 
 
-&#x20;           srConn.commit();
+           srConn.commit();
 
 
-&#x20;       } catch (Exception e) {
+       } catch (Exception e) {
 
 
-&#x20;           chConn.rollback();
+           chConn.rollback();
 
 
-&#x20;           throw new RuntimeException("StarRocks写入失败，回滚ClickHouse事务", e);
+           throw new RuntimeException("StarRocks写入失败，回滚ClickHouse事务", e);
 
 
-&#x20;       }
+       }
 
 
-&#x20;       chConn.commit();
+       chConn.commit();
 
 
-&#x20;   } catch (Exception e) {
+   } catch (Exception e) {
 
 
-&#x20;       throw new RuntimeException("双写失败", e);
+       throw new RuntimeException("双写失败", e);
 
 
-&#x20;   }
+   }
 
 
 }
@@ -464,40 +464,40 @@ import json
 def stream\_load\_data(data):
 
 
-&#x20;   url = "http://starrocks-be:8030/api/db/table/\_stream\_load"
+   url = "http://starrocks-be:8030/api/db/table/\_stream\_load"
 
 
-&#x20;   headers = {
+   headers = {
 
 
-&#x20;       "Content-Type": "application/json",
+       "Content-Type": "application/json",
 
 
-&#x20;       "Authorization": "Basic YWRtaW46YWRtaW4="
+       "Authorization": "Basic YWRtaW46YWRtaW4="
 
 
-&#x20;   }
+   }
 
 
-&#x20;   payload = {
+   payload = {
 
 
-&#x20;       "column\_separator": ",",
+       "column\_separator": ",",
 
 
-&#x20;       "rows": data
+       "rows": data
 
 
-&#x20;   }
+   }
 
 
-&#x20;   response = requests.post(url, headers=headers, data=json.dumps(payload))
+   response = requests.post(url, headers=headers, data=json.dumps(payload))
 
 
-&#x20;   if response.status\_code != 200:
+   if response.status\_code != 200:
 
 
-&#x20;       raise Exception("Stream Load failed: " + response.text)
+       raise Exception("Stream Load failed: " + response.text)
 ```
 
 #### 方案三：基于 MPP 并行计算的全量迁移方案&#xA;
@@ -620,28 +620,28 @@ import starrocks\_sdk
 def migrate\_shard(shard\_info):
 
 
-&#x20;   \# 连接ClickHouse
+   \# 连接ClickHouse
 
 
-&#x20;   ch\_client = clickhouse\_connect.Client(host=shard\_info\['ch\_host'], port=shard\_info\['ch\_port'], user=shard\_info\['ch\_user'], password=shard\_info\['ch\_password'])
+   ch\_client = clickhouse\_connect.Client(host=shard\_info\['ch\_host'], port=shard\_info\['ch\_port'], user=shard\_info\['ch\_user'], password=shard\_info\['ch\_password'])
 
 
-&#x20;   \# 查询分片数据
+   \# 查询分片数据
 
 
-&#x20;   data = ch\_client.query\_df(shard\_info\['query'])
+   data = ch\_client.query\_df(shard\_info\['query'])
 
 
-&#x20;   \# 连接StarRocks
+   \# 连接StarRocks
 
 
-&#x20;   sr\_client = starrocks\_sdk.connect(host=shard\_info\['sr\_host'], port=shard\_info\['sr\_port'], user=shard\_info\['sr\_user'], password=shard\_info\['sr\_password'])
+   sr\_client = starrocks\_sdk.connect(host=shard\_info\['sr\_host'], port=shard\_info\['sr\_port'], user=shard\_info\['sr\_user'], password=shard\_info\['sr\_password'])
 
 
-&#x20;   \# 写入StarRocks
+   \# 写入StarRocks
 
 
-&#x20;   sr\_client.insert\_into\_table(shard\_info\['table'], data)
+   sr\_client.insert\_into\_table(shard\_info\['table'], data)
 
 
 \# 划分数据分片
@@ -650,13 +650,13 @@ def migrate\_shard(shard\_info):
 shards = \[
 
 
-&#x20;   {'ch\_host': 'ch-node1', 'ch\_port': 9000, 'ch\_user': 'user', 'ch\_password': 'password', 'query': 'SELECT \* FROM table WHERE id < 1000', 'sr\_host': 'sr-node1', 'sr\_port': 9030, 'table': 'starrocks\_table'},
+   {'ch\_host': 'ch-node1', 'ch\_port': 9000, 'ch\_user': 'user', 'ch\_password': 'password', 'query': 'SELECT \* FROM table WHERE id < 1000', 'sr\_host': 'sr-node1', 'sr\_port': 9030, 'table': 'starrocks\_table'},
 
 
-&#x20;   {'ch\_host': 'ch-node2', 'ch\_port': 9000, 'ch\_user': 'user', 'ch\_password': 'password', 'query': 'SELECT \* FROM table WHERE id >= 1000 AND id < 2000', 'sr\_host': 'sr-node2', 'sr\_port': 9030, 'table': 'starrocks\_table'},
+   {'ch\_host': 'ch-node2', 'ch\_port': 9000, 'ch\_user': 'user', 'ch\_password': 'password', 'query': 'SELECT \* FROM table WHERE id >= 1000 AND id < 2000', 'sr\_host': 'sr-node2', 'sr\_port': 9030, 'table': 'starrocks\_table'},
 
 
-&#x20;   \# 更多分片...
+   \# 更多分片...
 
 
 ]
@@ -668,7 +668,7 @@ shards = \[
 with ProcessPoolExecutor(max\_workers=3) as executor:
 
 
-&#x20;   executor.map(migrate\_shard, shards)
+   executor.map(migrate\_shard, shards)
 ```
 
 #### 方案四：基于 Flink CDC 的数据实时同步方案（参考携程 Flink CDC 迁移案例）&#xA;
@@ -780,37 +780,37 @@ with ProcessPoolExecutor(max\_workers=3) as executor:
 CREATE TABLE ch\_source (
 
 
-&#x20;   id INT,
+   id INT,
 
 
-&#x20;   name STRING,
+   name STRING,
 
 
-&#x20;   create\_time TIMESTAMP(3),
+   create\_time TIMESTAMP(3),
 
 
-&#x20;   op STRING, -- 操作类型（INSERT, UPDATE, DELETE）
+   op STRING, -- 操作类型（INSERT, UPDATE, DELETE）
 
 
-&#x20;   PRIMARY KEY (id) NOT ENFORCED
+   PRIMARY KEY (id) NOT ENFORCED
 
 
 ) WITH (
 
 
-&#x20;   'connector' = 'clickhouse-cdc',
+   'connector' = 'clickhouse-cdc',
 
 
-&#x20;   'url' = 'jdbc:clickhouse://ch-node1:8123,ch-node2:8123,ch-node3:8123/database',
+   'url' = 'jdbc:clickhouse://ch-node1:8123,ch-node2:8123,ch-node3:8123/database',
 
 
-&#x20;   'table-name' = 'ch\_table',
+   'table-name' = 'ch\_table',
 
 
-&#x20;   'username' = 'user',
+   'username' = 'user',
 
 
-&#x20;   'password' = 'password'
+   'password' = 'password'
 
 
 );
@@ -822,34 +822,34 @@ CREATE TABLE ch\_source (
 CREATE TABLE sr\_sink (
 
 
-&#x20;   id INT,
+   id INT,
 
 
-&#x20;   name STRING,
+   name STRING,
 
 
-&#x20;   create\_time TIMESTAMP(3)
+   create\_time TIMESTAMP(3)
 
 
 ) WITH (
 
 
-&#x20;   'connector' = 'starrocks',
+   'connector' = 'starrocks',
 
 
-&#x20;   'jdbc-url' = 'jdbc:starrocks://sr-node1:9030,sr-node2:9030,sr-node3:9030/database',
+   'jdbc-url' = 'jdbc:starrocks://sr-node1:9030,sr-node2:9030,sr-node3:9030/database',
 
 
-&#x20;   'table-name' = 'sr\_table',
+   'table-name' = 'sr\_table',
 
 
-&#x20;   'username' = 'user',
+   'username' = 'user',
 
 
-&#x20;   'password' = 'password',
+   'password' = 'password',
 
 
-&#x20;   'sink.properties.format' = 'csv'
+   'sink.properties.format' = 'csv'
 
 
 );
