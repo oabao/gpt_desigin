@@ -78,6 +78,7 @@ StarRocks 集群替换 ClickHouse 技术方案设计文档
 
 ### （三）全链路解决方案&#xA;
 
+
 #### 方案一：基于联邦查询的数据实时迁移方案&#xA;
 
 ##### 1. 技术原理&#xA;
@@ -128,17 +129,15 @@ StarRocks 集群替换 ClickHouse 技术方案设计文档
     ```mermaid
     graph TD
         Start[开始] --> A1[准备阶段：安装StarRocks，配置联邦查询连接ClickHouse]
-        A1 --> A2[全量迁移阶段：通过联邦查询从ClickHouse全量读取数据，写入StarRocks（非停机阶段，业务正常运行）]
-        A2 --> A3[增量同步阶段：监听ClickHouse数据变更，通过联邦查询实时同步增量数据到StarRocks（非停机阶段）]
-        A3 --> A4[停机窗口开始：停止ClickHouse写入操作，冻结数据]
-        A4 --> A5[最终增量同步：同步停机期间ClickHouse的增量数据到StarRocks]
+        A1 --> A2[数据共存阶段：通过联邦查询从Starrocks中查询Clickhouse数据]
+        A2 --> A3[数据同步阶段：后台同步Clickhouse数据到Starrocks]
+        A3 --> A4[Clickhouse数据下线：Clickhouse数据全部过期后，下线掉Clickhouse]
+        A4 --> A5[服务切换：用户查询从联邦查询切换到Starrocks查询]
         A5 --> A6[数据校验：对比新旧集群数据一致性]
         A6 --> A7[服务切换：将服务层查询请求切换到StarRocks]
         A7 --> A8[停机窗口结束：启动StarRocks写入操作，业务恢复正常]
         A8 --> End[结束]
     ```
-
-（停机窗口时间规划：A4 到 A8 阶段，预计耗时 6 小时，包含数据冻结、最终增量同步、数据校验和服务切换）
 
 
 
