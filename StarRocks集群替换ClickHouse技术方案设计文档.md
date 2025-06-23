@@ -133,10 +133,7 @@ StarRocks 集群替换 ClickHouse 技术方案设计文档
         A2 --> A3[数据同步阶段：后台同步Clickhouse数据到Starrocks]
         A3 --> A4[Clickhouse数据下线：Clickhouse数据全部过期后，下线掉Clickhouse]
         A4 --> A5[服务切换：用户查询从联邦查询切换到Starrocks查询]
-        A5 --> A6[数据校验：对比新旧集群数据一致性]
-        A6 --> A7[服务切换：将服务层查询请求切换到StarRocks]
-        A7 --> A8[停机窗口结束：启动StarRocks写入操作，业务恢复正常]
-        A8 --> End[结束]
+        A5 --> End[结束]
     ```
 
 
