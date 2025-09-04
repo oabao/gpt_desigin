@@ -16,25 +16,65 @@
 
 1.  **归档历史数据模式**
 
-*   技术原理：直接在现有服务器集群中安装部署 StarRocks 3.3 版本，保留原有的 ClickHouse 集群作为历史数据归档存储。由于不需要进行数据迁移，仅需进行新集群的部署和服务切换。
+*   **核心逻辑**：保留现有 ClickHouse 集群作为历史数据归档存储，全新部署 StarRocks 集群承接新业务读写，通过一次性切换实现数据源迁移。
 
-*   实施路径：
+*   **功能约束实现**：
 
-*   集群部署：在 3 台服务器上划分部分资源用于部署 StarRocks 集群，包括 FE（Frontend）节点和 BE（Backend）节点。FE 节点负责元数据管理和查询规划，BE 节点负责数据存储和计算。具体资源分配根据服务器现有负载情况确定，确保 StarRocks 集群能够正常运行。
 
-*   服务切换：待 StarRocks 集群部署完成并验证无误后，将服务层的数据入库和查询请求切换到 StarRocks 集群。
+    *   **数据源切换**：在 StarRocks 集群部署完成并验证通过后，通过修改服务层配置文件（如数据库连接池地址、API 路由指向），将所有数据入库接口（如 ETL 管道、业务系统写入接口）和查询接口（如 BI 工具、应用程序查询）的数据源地址统一指向 StarRocks 集群。切换完成后，通过灰度流量验证确保无请求路由至 ClickHouse。
+
+    *   **ClickHouse 线程调整**：登录 ClickHouse 集群所有节点，修改`config.xml`配置文件中`background_pool_size`参数（默认为 16），设置为`2`（对应 2C 资源），并执行`SYSTEM RELOAD CONFIG`命令使配置生效。调整后通过`SELECT * FROM system.metrics WHERE metric LIKE '%BackgroundPool%'`监控线程池状态，确保 merge 线程数量稳定在 2C。
+
+*   **实施步骤**：
+
+1.  规划服务器资源分配（每台服务器划分 10C/80GB 内存给 StarRocks，剩余资源保留给 ClickHouse）
+
+2.  部署 StarRocks 集群（1FE+3BE 架构，FE 部署在服务器 1，BE 分别部署在 3 台服务器）
+
+3.  在 StarRocks 中创建与 ClickHouse 结构一致的表（通过`CREATE TABLE`语句复刻表结构，注意数据类型映射：如 ClickHouse 的`DateTime64`对应 StarRocks 的`DATETIMEV2`）
+
+4.  调整 ClickHouse merge 线程参数并验证
+
+5.  执行服务层数据源切换（选择业务低峰期，预计耗时 30 分钟）
+
+6.  切换后验证（执行冒烟测试，检查读写功能正常）
 
 1.  **同步历史数据模式**
 
-*   技术原理：让用户选择需要同步的数据范围，后台启动同步进程，分批将 ClickHouse 中的数据写入 StarRocks。同步过程中通过控制数据传输速率，确保 IO 消耗不超过 100MB/s，以减少对查询性能的影响。
+*   **核心逻辑**：支持用户自定义时间范围同步历史数据，通过分批传输控制 IO 负载，同步完成后切换数据源，实现全量数据迁移。
 
-*   实施路径：
+*   **功能约束实现**：
 
-*   数据范围选择：用户在界面上选择需要同步的起始时间和结束时间，系统根据用户选择确定数据范围。
 
-*   同步进程启动：用户点击开始同步后，后台启动同步进程，该进程从 ClickHouse 中读取指定范围内的数据，按照一定的批次大小进行处理后写入 StarRocks。
+    *   **数据源切换**：同步完成且数据一致性校验通过后，采用与归档模式相同的配置修改方式，将服务层数据源切换至 StarRocks。切换前需暂停新数据写入（或开启双写），确保最后一批历史数据与新数据无缝衔接。
 
-*   进度监控：同步进程实时计算同步进度和预期剩余时间，并将这些信息反馈到界面上，方便用户了解同步情况。
+    *   **IO 控制机制**：
+
+
+        *   基于 Linux `iostat`工具实时监控磁盘 IO 使用率（每 5 秒采样一次），当发现`%util`指标超过 70%（对应 100MB/s IO 带宽）时，触发限流逻辑。
+
+        *   同步进程通过动态调整批次大小实现限流：初始批次为 10 万行 / 批，当 IO 超限时自动缩减为 5 万行 / 批，间隔时间从 1 秒延长至 2 秒；当 IO 使用率低于 50% 时，恢复至初始批次。
+
+    *   **进度展示**：
+
+
+        *   前端通过进度条展示同步百分比（已同步字节数 / 总字节数），并基于最近 5 分钟平均速率计算剩余时间（剩余字节数 / 平均速率）。
+
+        *   后端每 30 秒推送一次进度数据（包含已同步量、总容量、速率、剩余时间），前端实时更新界面。
+
+*   **实施步骤**：
+
+1.  用户在界面选择同步时间范围（如 2023-01-01 至 2023-12-31），系统自动估算数据量（通过 ClickHouse 的`SELECT SUM(data_compressed_bytes) FROM system.parts WHERE partition < ...`）
+
+2.  启动同步进程（采用多线程架构，每表一个线程，最多并发 3 个表）
+
+3.  按批次同步数据（读取→转换→写入→记录进度），实时监控 IO 并动态调整速率
+
+4.  同步完成后执行全量校验（抽样 10% 数据对比、关键指标聚合校验）
+
+5.  校验通过后切换数据源，关闭 ClickHouse 集群
+
+6.  切换后验证（全量数据查询测试、性能压测）
 
 ### （二）功能约束实现
 
@@ -217,132 +257,6 @@ sequenceDiagram
     后端服务->>前端: 同步完成提示
 ```
 
-3.  **系统架构图**
-
-
-    ```mermaid
-    graph TD
-    subgraph 服务器集群
-    A[服务器1]
-    B[服务器2]
-    C[服务器3]
-    end
-    subgraph ClickHouse集群
-    D[ClickHouse节点1]
-    E[ClickHouse节点2]
-    F[ClickHouse节点3]
-    end
-    subgraph StarRocks集群
-    G[FE节点1]
-    H[BE节点1]
-    I[FE节点2]
-    J[BE节点2]
-    K[FE节点3]
-    L[BE节点3]
-    end
-    A --> D
-    A --> G
-    A --> H
-    B --> E
-    B --> I
-    B --> J
-    C --> F
-    C --> K
-    C --> L
-    D --> E
-    E --> F
-    G --> I
-    I --> K
-    H --> J
-    J --> L
-    G --> H
-    I --> J
-    K --> L
-    ```
-
-## 六、前后端交互的 API 设计
-
-
-
-1.  **迁移模式选择 API**
-
-*   接口名称：`/api/migration/selectMode`
-
-*   请求方法：POST
-
-*   请求参数：`mode`（字符串，取值为 "archive" 或 "sync"）
-
-*   响应结果：`{"code": 200, "message": "模式选择成功"}`
-
-1.  **同步数据范围提交 API**
-
-*   接口名称：`/api/migration/submitSyncRange`
-
-*   请求方法：POST
-
-*   请求参数：`startTime`（时间戳）、`endTime`（时间戳）
-
-*   响应结果：`{"code": 200, "message": "数据范围提交成功", "taskId": "任务ID"}`
-
-1.  **同步进度查询 API**
-
-*   接口名称：`/api/migration/querySyncProgress`
-
-*   请求方法：GET
-
-*   请求参数：`taskId`（字符串）
-
-*   响应结果：`{"code": 200, "progress": 60, "remainingTime": "30分钟", "totalData": "100GB", "syncedData": "60GB"}`（progress 为百分比，remainingTime 为预期剩余时间）
-
-1.  **服务切换 API**
-
-*   接口名称：`/api/migration/switchService`
-
-*   请求方法：POST
-
-*   响应结果：`{"code": 200, "message": "服务切换成功"}`
-
-## 七、数据同步模块设计
-
-#### 1. 整体架构图
-
-
-
-```mermaid
-graph TD
-    subgraph 服务器集群
-        S1[服务器1<br>32C/256GB/8×16TB HDD]
-        S2[服务器2<br>32C/256GB/8×16TB HDD]
-        S3[服务器3<br>32C/256GB/8×16TB HDD]
-    end
-    
-    subgraph 归档模式架构
-        CH1[ClickHouse节点1<br>22C/176GB]
-        CH2[ClickHouse节点2<br>32C/256GB]
-        CH3[ClickHouse节点3<br>32C/256GB]
-        SR_FE[StarRocks FE<br>10C/80GB]
-        SR_BE1[StarRocks BE1<br>10C/80GB]
-        SR_BE2[StarRocks BE2<br>10C/80GB]
-        SR_BE3[StarRocks BE3<br>10C/80GB]
-    end
-    
-    S1 --> CH1
-    S1 --> SR_FE
-    S1 --> SR_BE1
-    S2 --> CH2
-    S2 --> SR_BE2
-    S3 --> CH3
-    S3 --> SR_BE3
-    
-    Client[业务客户端] -->|新数据读写| SR_FE
-    Client -->|历史查询| CH1
-```
-
-#### 2. 同步流程时序图
-
-
-
-
 
 ### （四）前后端交互 API 设计
 
@@ -350,8 +264,8 @@ graph TD
 
 | 接口名称                      | 请求方法 | 请求参数                                                   | 响应结果                                                                                                           | 说明               |
 | ------------------------- | ---- | ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- | ---------------- |
-| `/api/migration/mode`     | POST | `{"mode": "archive\|sync"}`                            | `{"code": 200, "msg": "模式选择成功", "estimatedTime": "30分钟"}`                                                      | 选择迁移模式，返回预估耗时    |
-| `/api/migration/range`    | POST | `{"startTime": "2023-01-01", "endTime": "2023-12-31"}` | `{"code": 200, "dataSize": "15.6TB", "estimatedSyncTime": "6.2小时"}`                                            | 提交同步时间范围，返回预估数据量 |
+| `/api/migration/mode`     | POST | `{}`                            | `{"code": 200, "msg": "模式选择成功", "estimatedTime": "30分钟"}`                                                      | 选择迁移模式，返回预估耗时    |
+| `/api/migration/range`    | POST | `{"mode": "archive\|sync"，"startTime": "2023-01-01", "endTime": "2023-12-31"}` | `{"code": 200, "dataSize": "15.6TB", "estimatedSyncTime": "6.2小时"}`                                            | 提交同步时间范围，返回预估数据量 |
 | `/api/migration/start`    | POST | `{"taskId": "sync_123"}`                               | `{"code": 200, "msg": "同步已启动", "taskId": "sync_123"}`                                                          | 启动同步任务           |
 | `/api/migration/progress` | GET  | `{"taskId": "sync_123"}`                               | `{"code": 200, "progress": 60, "synced": "9.4TB", "total": "15.6TB", "speed": "85MB/s", "remaining": "2.1小时"}` | 查询同步进度           |
 | `/api/migration/switch`   | POST | `{}`                                                   | `{"code": 200, "msg": "数据源已切换至StarRocks"}`                                                                     | 手动触发数据源切换        |
