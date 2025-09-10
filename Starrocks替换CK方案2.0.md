@@ -208,10 +208,8 @@
     graph TD
     A[系统升级] --> A1[安装starrocks，升级其他服务]
     A1 --> B{选择迁移模式}
-    B -->|归档历史数据| C[安装部署StarRocks]
-    C --> D[调整ClickHouse merge线程为2C]
-    D --> E[切换服务层数据源至StarRocks]
-    E --> F[完成迁移]
+    B -->|归档历史数据| D[调整ClickHouse merge线程为2C]
+    D --> F[完成迁移]
     B -->|同步历史数据模式| G[用户选择数据范围]
     G --> H[用户点击开始同步]
     H --> I[后台启动同步进程]
