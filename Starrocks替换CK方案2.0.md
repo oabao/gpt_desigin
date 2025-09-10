@@ -280,8 +280,187 @@ sequenceDiagram
 | 数据不一致风险 | 同步过程中 ClickHouse 数据发生变更（如更新 / 删除），导致与 StarRocks 不一致  | 中    | 1. 同步前对 ClickHouse 表执行`FREEZE PARTITION`创建快照2. 同步期间禁止对历史数据修改，新数据通过双写机制同步               |
 | IO 超限风险 | 同步时 IO 突发超过 100MB/s，影响业务查询性能                         | 中    | 1. 基于`iostat`实现 IO 闭环控制，超限时自动降速2. 预设安全阈值（70% IO 使用率），提前触发限流                            |
 | 切换失败风险  | 数据源切换后出现功能异常，需回滚至 ClickHouse                         | 高    | 1. 切换前备份服务层配置，支持一键回滚2. 切换后执行自动化校验用例，5 分钟内无异常则确认成功                                      |
+| 效果风险  | 切换过程中未开始同步的CK数据无法被查询可能影响安全效果                         | 高    | 1、通过SR共享catalog的机制将CK数据映射到SR中，确保从SR可以直接查询CK数据，降低业务影响（SR catalog：https://docs.starrocks.io/docs/3.5/data_source/catalog/jdbc_catalog/ ），约束：使用catalog方案目前只支持基础类型，并且查询性能会大幅下降。 2、XDR业务层支持同时查CK和SR，当时间跨度横跨在内存中完成最终指标聚合 3、数据湖单独提供一套引擎层，类似于presto支持业务场景的数据联邦查询
+                                      |
 
 
 
+###效果风险解决方案说明：
+
+
+---
+
+### 方案一：StarRocks JDBC Catalog 联邦查询方案
+
+#### 实现思路与架构图
+
+该方案利用 StarRocks 的 JDBC Catalog 功能，将 ClickHouse 映射为一个外部数据源。当查询命中的数据在 SR 本地表中不存在时，SR 会通过 JDBC 驱动自动去 CK 中查询，并在 SR 内部完成数据的拼接和计算。
+
+```mermaid
+flowchart TD
+    subgraph A [方案一：SR JDBC Catalog 架构]
+        direction LR
+        subgraph Client [应用层]
+            App[应用程序]
+        end
+
+        subgraph SR [StarRocks 层]
+            SRO[SR 优化器<br>与执行引擎]
+            SRL[SR 本地表<br>（新数据）]
+            JDBCCatalog[[JDBC Catalog<br>（指向 CK）]]
+        end
+
+        subgraph CK [ClickHouse 层]
+            CKTable[CK 源表<br>（历史数据）]
+        end
+
+        App --> SRO
+        SRO --> SRL
+        SRO --> JDBCCatalog
+        JDBCCatalog -.-> CKTable
+    end
 ```
+
+**工作流程：**
+1.  创建 Catalog：在 StarRocks 中执行 `CREATE EXTERNAL CATALOG ... PROPERTIES type='jdbc'...`，配置好 CK 的 JDBC 连接信息。
+2.  应用查询：应用程序的查询语句直接发给 StarRocks。
+3.  智能路由：StarRocks 优化器根据查询的 `WHERE` 条件（尤其是时间条件）判断数据所在位置。
+    *   如果数据在 SR 本地表，则直接读取。
+    *   如果需要的数据在 CK，则通过 JDBC Catalog 向 CK 发起查询。
+    *   **如果时间跨度横跨两地**，SR 会**并行地**从本地表和 CK 拉取数据，然后在 SR 内部进行聚合、计算，最终返回一个完整的结果给客户端。
+4.  对应用透明：整个过程对应用程序是完全透明的，应用无感知。
+
+---
+
+### 方案二：业务层双写双查聚合方案
+
+#### 实现思路与架构图
+
+该方案在业务层（或一个单独的数据查询网关）进行改造，使其具备同时查询 SR 和 CK 的能力，并在内存中完成数据的整合与计算。
+
+```mermaid
+flowchart TD
+    subgraph B [方案二：业务层双查聚合架构]
+        direction TB
+        subgraph Client [应用层]
+            App[应用程序<br>（或查询网关）]
+        end
+
+        App --> DSL[双查询生成]
+        DSL --> QuerySR[查询 StarRocks<br>（新数据）]
+        DSL --> QueryCK[查询 ClickHouse<br>（历史数据）]
+
+        subgraph SR [StarRocks]
+            SRLocal[SR 本地表]
+        end
+
+        subgraph CK [ClickHouse]
+            CKTable[CK 源表]
+        end
+
+        QuerySR --> SRLocal
+        QueryCK --> CKTable
+
+        SRLocal --> ResultSR[结果集 A]
+        CKTable --> ResultCK[结果集 B]
+
+        ResultSR --> Aggregate[内存数据聚合<br>（去重、求和、排序等）]
+        ResultCK --> Aggregate
+
+        Aggregate --> FinalResult[最终结果]
+    end
+```
+
+**工作流程：**
+1.  查询拆分：应用程序（或网关）接收到查询请求后，根据配置好的时间边界，将一条查询拆分成两条 SQL：
+    *   一条发给 StarRocks，查询 `time >= '同步开始时间'` 的数据。
+    *   一条发给 ClickHouse，查询 `time < '同步开始时间'` 的数据。
+2.  并行查询：同时向 SR 和 CK 发起查询请求。
+3.  内存聚合：等待两个数据源的结果返回后，在业务层内存中执行最终的数据聚合逻辑（例如：对两个结果集进行 `UNION ALL`，然后重新 `SUM`、`GROUP BY`，或者进行排序分页等）。
+4.  返回结果：将聚合后的完整结果返回给前端。
+
+---
+
+### 方案三：数据湖联邦查询引擎方案
+
+#### 实现思路与架构图
+
+该方案引入一个第三方查询引擎（如 Presto/Trino），其能够同时对接 SR 和 CK，作为一个统一查询入口，对应用层提供数据联邦查询能力。
+
+```mermaid
+flowchart TD
+    subgraph C [方案三：数据湖联邦查询架构]
+        direction TB
+        subgraph Client [应用层]
+            App[应用程序]
+        end
+
+        subgraph Federation [联邦查询层]
+            Presto[Presto/Trino<br>（协调器）]
+        end
+
+        subgraph Connectors [连接器]
+            ConnSR[SR Connector]
+            ConnCK[CK Connector]
+        end
+
+        subgraph SR [StarRocks]
+            SRLocal[SR 本地表]
+        end
+
+        subgraph CK [ClickHouse]
+            CKTable[CK 源表]
+        end
+
+        App --> Presto
+        Presto --> ConnSR
+        Presto --> ConnCK
+        ConnSR --> SRLocal
+        ConnCK --> CKTable
+
+        SRLocal --> ResultSR[结果集 A]
+        CKTable --> ResultCK[结果集 B]
+
+        ResultSR --> Presto
+        ResultCK --> Presto
+
+        Presto --> FinalAggregate[内存数据聚合]
+        FinalAggregate --> FinalResult[最终结果]
+    end
+```
+
+**工作流程：**
+1.  统一入口：应用程序将查询请求发送给 Presto/Trino。
+2.  语法解析：Presto 解析 SQL，根据配置的 Catalog 规则，确定哪些表来自 SR，哪些来自 CK。
+3.  下推查询：Presto 将计算尽可能下推到 SR 和 CK 这两个数据源中去执行（谓词下推、聚合下推等）。
+4.  联邦聚合：Presto 从两个数据源拉取部分结果集，在其工作内存中进行最终的混合计算。
+5.  返回结果：将结果返回给应用程序。
+
+---
+
+### 深度可行性对比
+
+| 维度 | 方案一：SR JDBC Catalog | 方案二：业务层双查聚合 | 方案三：数据湖联邦查询 |
+| :--- | :--- | :--- | :--- |
+| **核心原理** | 利用 SR 自身能力实现联邦查询 | 业务层代码硬编码或网关路由 | 引入独立通用联邦查询引擎 |
+| **查询性能** | **较差**。JDBC 连接是单点，网络开销大，复杂查询性能下降严重，且压力集中在 CK 上。 | **可控**。取决于业务层聚合逻辑的复杂度。双并行查询，延迟取决于最慢的数据源。 | **中等**。优于 JDBC Catalog，但次于直接查询。Presto 有优化能力，但多一层网络跳转。 |
+| **业务侵入性** | **极低**。应用无感知，无需修改代码，只需切换数据源为 SR。 | **极高**。需要重写所有相关查询的代码逻辑，开发、测试工作量巨大。 | **低**。应用只需将查询端点从 CK/SR 改为 Presto，SQL 语法可能需要微调。 |
+| **功能完整性** | **受限**。受限于 JDBC Catalog 支持的数据类型和函数，复杂查询可能报错。 | **完全可控**。业务层想怎么聚合都行，灵活性最高。 | **强大**。Presto/Trino 对复杂 SQL 支持非常好，功能完整。 |
+| **维护成本** | **低**。只需在 SR 中维护 Catalog 配置，运维简单。 | **极高**。逻辑耦合在业务代码中，后续难以维护。任何表结构变更都可能需要修改代码。 | **中高**。需要额外维护一套 Presto/Trino 集群，包括其高可用、性能调优等。 |
+| **长期价值** | **低**。是**临时过渡方案**。数据同步完成后即可删除 Catalog，直接查询本地表。 | **无**。迁移完成后，所有相关代码需要被回滚或废弃，是**纯粹的技术负债**。 | **高**。**可以作为长期数据平台战略**。未来接入 Hive、Iceberg、MySQL 等数据源都非常方便。 |
+| **可行性结论** | **推荐作为短期过渡方案**。优点在于**快速落地**，能第一时间解决问题，且对业务影响最小。**必须接受其性能损耗**，并明确其临时性。 | **最不推荐**。**除非其他方案都走不通**。该方案将迁移的复杂性完全转嫁给了业务开发，成本高昂且易出错，后期维护是噩梦。 | **如果团队有长期数据湖/数据中台规划，这是最佳选择**。虽然短期部署和运维成本较高，但一举多得，不仅解决了当前问题，还为未来打下了更好的基础。 |
+
+### 专家总结与建议
+
+1.  **首选方案（短期快速见效）**：**方案一（SR JDBC Catalog）**。这是最符合你们当前架构（产品升级后所有服务直接访问 StarRocks）的**最小化侵入式方案**。它能以最快速度上线，保证业务在迁移期间不受影响。**注意事项**：必须严格限制通过 Catalog 查询的 SQL 复杂度，最好只用于简单的 `SELECT ... WHERE ...` 查询，避免复杂 Join 和聚合。并提前和业务方沟通性能下降的预期。
+
+2.  **战略方案（长期平台建设）**：**方案三（数据湖联邦查询）**。如果团队有精力和规划，这是一个将挑战转化为机遇的方案。部署一套 Presto/Trino 可以作为统一查询网关，不仅解决当前 CK->SR 的迁移问题，未来还可以轻松集成其他数据源，构建企业级数据湖仓一体化平台。
+
+3.  **尽量避免的方案**：**方案二（业务层聚合）**。这个方案的开发和维护成本是黑洞，除非你们的查询非常简单且数量极少，否则强烈不推荐。它会使核心业务代码变得极其臃肿和脆弱。
+
+**最终行动建议**：
+**采用“方案一为主，方案三为远期规划”的组合策略**。
+- **立即实施方案一**，确保产品升级和迁移过程平稳。
+- **在迁移后期，数据同步完成后，逐步减少并最终禁用 JDBC Catalog**，让所有查询都走向 SR 本地表，获得最佳性能。
+- **同时，可以开始调研和测试方案三**，为未来的数据平台演进做好技术储备。
 
